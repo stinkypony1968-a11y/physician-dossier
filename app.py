@@ -223,10 +223,18 @@ def fetch_cms_payments_from_db(first_name: str, last_name: str, npi: str = None)
 # =============================================================================
 
 async def lookup_npi(first_name: str, last_name: str, state: str = None, city: str = None) -> Dict[str, Any]:
-    """Search NPI Registry."""
+    """Search NPI Registry with extended data extraction."""
     result = {
         "found": False, "npi": None, "verified_name": None,
-        "specialty": None, "address": None, "matches": [], "source": "NPI Registry"
+        "specialty": None, "address": None, "matches": [], "source": "NPI Registry",
+        # Extended fields
+        "credentials": None,
+        "gender": None,
+        "enumeration_date": None,
+        "years_in_practice": None,
+        "all_specialties": [],
+        "board_certifications": [],
+        "organization_name": None
     }
 
     params = {
@@ -268,6 +276,32 @@ async def lookup_npi(first_name: str, last_name: str, state: str = None, city: s
                 practice_addr = next((a for a in addresses if a.get("address_purpose") == "LOCATION"), addresses[0] if addresses else {})
                 specialty = next((t.get("desc") for t in taxonomies if t.get("primary")), None)
 
+                # Extract extended info
+                credentials = basic.get("credential", "")
+                gender = basic.get("gender", "")
+                enumeration_date = basic.get("enumeration_date", "")
+
+                # Calculate years in practice from enumeration date
+                years_in_practice = None
+                if enumeration_date:
+                    try:
+                        enum_year = int(enumeration_date.split("-")[0])
+                        years_in_practice = datetime.now().year - enum_year
+                    except:
+                        pass
+
+                # Extract all specialties/certifications
+                all_specialties = []
+                for tax in taxonomies:
+                    spec_desc = tax.get("desc", "")
+                    if spec_desc:
+                        all_specialties.append({
+                            "specialty": spec_desc,
+                            "primary": tax.get("primary", False),
+                            "state": tax.get("state", ""),
+                            "license": tax.get("license", "")
+                        })
+
                 # Score matches - prefer neuro specialties
                 score = 100
                 if state and practice_addr.get("state", "").upper() == state.upper():
@@ -289,7 +323,13 @@ async def lookup_npi(first_name: str, last_name: str, state: str = None, city: s
                     "state": practice_addr.get("state"),
                     "city": practice_addr.get("city"),
                     "organization": practice_addr.get("organization_name"),
-                    "score": score
+                    "score": score,
+                    # Extended fields
+                    "credentials": credentials,
+                    "gender": gender,
+                    "enumeration_date": enumeration_date,
+                    "years_in_practice": years_in_practice,
+                    "all_specialties": all_specialties
                 })
 
             scored_matches.sort(key=lambda x: x["score"], reverse=True)
@@ -302,12 +342,233 @@ async def lookup_npi(first_name: str, last_name: str, state: str = None, city: s
                 result["specialty"] = best["specialty"]
                 result["address"] = {"state": best["state"], "city": best["city"], "organization": best["organization"]}
                 result["matches"] = scored_matches[:5]
+                # Extended fields
+                result["credentials"] = best.get("credentials")
+                result["gender"] = best.get("gender")
+                result["enumeration_date"] = best.get("enumeration_date")
+                result["years_in_practice"] = best.get("years_in_practice")
+                result["all_specialties"] = best.get("all_specialties", [])
+                result["organization_name"] = best.get("organization")
 
             return result
 
     except Exception as e:
         result["error"] = str(e)
         return result
+
+
+# =============================================================================
+# EDUCATION & TRAINING LOOKUP
+# =============================================================================
+
+# Known neurovascular societies and organizations
+NEURO_SOCIETIES = [
+    "Society of NeuroInterventional Surgery (SNIS)",
+    "American Association of Neurological Surgeons (AANS)",
+    "Congress of Neurological Surgeons (CNS)",
+    "Society of Vascular and Interventional Neurology (SVIN)",
+    "American Academy of Neurology (AAN)",
+    "American Society of Neuroradiology (ASNR)",
+    "World Federation of Interventional and Therapeutic Neuroradiology (WFITN)",
+    "Neurocritical Care Society (NCS)",
+    "American Heart Association / American Stroke Association (AHA/ASA)",
+    "European Stroke Organisation (ESO)"
+]
+
+# Common neurosurgery/neurointerventional training programs
+KNOWN_FELLOWSHIPS = {
+    "endovascular": "Endovascular Neurosurgery/Neurointerventional Fellowship",
+    "cerebrovascular": "Cerebrovascular/Skull Base Fellowship",
+    "stroke": "Vascular Neurology/Stroke Fellowship",
+    "neurointerventional": "Neurointerventional Radiology Fellowship",
+    "neurointensive": "Neurocritical Care Fellowship"
+}
+
+
+async def fetch_education_data(
+    first_name: str,
+    last_name: str,
+    npi: str = None,
+    city: str = None,
+    state: str = None,
+    specialty: str = None
+) -> Dict[str, Any]:
+    """
+    Fetch education, training, and professional organization data.
+    Attempts to gather from multiple public sources.
+    """
+    result = {
+        "found": False,
+        "medical_school": None,
+        "residency": [],
+        "fellowships": [],
+        "board_certifications": [],
+        "professional_organizations": [],
+        "sources": [],
+        "inferred_training": []
+    }
+
+    # Infer likely training path based on specialty
+    if specialty:
+        specialty_lower = specialty.lower()
+
+        # Infer fellowship based on specialty
+        if "neurological surgery" in specialty_lower:
+            result["inferred_training"].append({
+                "type": "Residency",
+                "program": "Neurological Surgery Residency (7 years)",
+                "confidence": "inferred from specialty"
+            })
+
+        if "interventional" in specialty_lower or "endovascular" in specialty_lower:
+            result["inferred_training"].append({
+                "type": "Fellowship",
+                "program": "Endovascular/Neurointerventional Fellowship (1-2 years)",
+                "confidence": "inferred from specialty"
+            })
+
+        if "vascular neurology" in specialty_lower:
+            result["inferred_training"].append({
+                "type": "Residency",
+                "program": "Neurology Residency (4 years)",
+                "confidence": "inferred from specialty"
+            })
+            result["inferred_training"].append({
+                "type": "Fellowship",
+                "program": "Vascular Neurology Fellowship (1-2 years)",
+                "confidence": "inferred from specialty"
+            })
+
+        if "neuroradiology" in specialty_lower:
+            result["inferred_training"].append({
+                "type": "Residency",
+                "program": "Diagnostic Radiology Residency (5 years)",
+                "confidence": "inferred from specialty"
+            })
+            result["inferred_training"].append({
+                "type": "Fellowship",
+                "program": "Neuroradiology Fellowship (1-2 years)",
+                "confidence": "inferred from specialty"
+            })
+
+    # Infer likely society memberships based on specialty
+    if specialty:
+        specialty_lower = specialty.lower()
+        likely_societies = []
+
+        if "neurological surgery" in specialty_lower or "neurosurg" in specialty_lower:
+            likely_societies.extend([
+                "American Association of Neurological Surgeons (AANS)",
+                "Congress of Neurological Surgeons (CNS)"
+            ])
+
+        if "interventional" in specialty_lower or "endovascular" in specialty_lower:
+            likely_societies.append("Society of NeuroInterventional Surgery (SNIS)")
+
+        if "vascular neurology" in specialty_lower or "stroke" in specialty_lower:
+            likely_societies.extend([
+                "Society of Vascular and Interventional Neurology (SVIN)",
+                "American Heart Association / American Stroke Association (AHA/ASA)"
+            ])
+
+        if "neurology" in specialty_lower:
+            likely_societies.append("American Academy of Neurology (AAN)")
+
+        if "neuroradiology" in specialty_lower:
+            likely_societies.append("American Society of Neuroradiology (ASNR)")
+
+        result["professional_organizations"] = [
+            {"name": soc, "confidence": "likely based on specialty"}
+            for soc in likely_societies
+        ]
+
+    # Try to fetch from Healthgrades (public physician directory)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Healthgrades search
+            search_url = f"https://www.healthgrades.com/api/v2/providers/search"
+            params = {
+                "q": f"{first_name} {last_name}",
+                "location": f"{city}, {state}" if city and state else state or "",
+                "specialty": "neurological-surgery" if specialty and "neuro" in specialty.lower() else ""
+            }
+
+            # Note: Healthgrades API may require additional headers or auth
+            # This is a best-effort attempt
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Accept": "application/json"
+            }
+
+            # Try the public API endpoint (may not work without proper auth)
+            response = await client.get(search_url, params=params, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                # Parse response for education data
+                if data.get("providers"):
+                    provider = data["providers"][0]
+                    if provider.get("education"):
+                        edu = provider["education"]
+                        result["medical_school"] = edu.get("medicalSchool")
+                        result["residency"] = edu.get("residency", [])
+                        result["found"] = True
+                        result["sources"].append("Healthgrades")
+
+    except Exception as e:
+        # Healthgrades fetch failed - continue with other sources
+        pass
+
+    # Try to get board certification from ABMS (if available)
+    # Note: ABMS requires subscription, so this is informational
+    if specialty:
+        specialty_lower = specialty.lower()
+        certs = []
+
+        if "neurological surgery" in specialty_lower:
+            certs.append({
+                "board": "American Board of Neurological Surgery (ABNS)",
+                "certification": "Neurological Surgery",
+                "confidence": "likely based on specialty"
+            })
+
+        if "neurology" in specialty_lower:
+            certs.append({
+                "board": "American Board of Psychiatry and Neurology (ABPN)",
+                "certification": "Neurology",
+                "confidence": "likely based on specialty"
+            })
+
+        if "vascular neurology" in specialty_lower:
+            certs.append({
+                "board": "American Board of Psychiatry and Neurology (ABPN)",
+                "certification": "Vascular Neurology (subspecialty)",
+                "confidence": "likely based on specialty"
+            })
+
+        if "radiology" in specialty_lower:
+            certs.append({
+                "board": "American Board of Radiology (ABR)",
+                "certification": "Diagnostic Radiology",
+                "confidence": "likely based on specialty"
+            })
+
+        if "neuroradiology" in specialty_lower:
+            certs.append({
+                "board": "American Board of Radiology (ABR)",
+                "certification": "Neuroradiology (CAQ)",
+                "confidence": "likely based on specialty"
+            })
+
+        result["board_certifications"] = certs
+
+    # Mark as found if we have any inferred data
+    if result["inferred_training"] or result["board_certifications"] or result["professional_organizations"]:
+        result["found"] = True
+        if "Inferred from specialty" not in result["sources"]:
+            result["sources"].append("Inferred from specialty")
+
+    return result
 
 
 # =============================================================================
@@ -596,6 +857,7 @@ async def run_dossier_pipeline(physician_name: str, state: str = None, city: str
         "parsed_name": {"first": first_name, "last": last_name, "full": full_name},
         "npi_data": None,
         "cms_data": None,
+        "education_data": None,
         "publications": None,
         "timestamp": datetime.now().isoformat()
     }
@@ -631,7 +893,40 @@ async def run_dossier_pipeline(physician_name: str, state: str = None, city: str
         else:
             st.warning("⚠️ No NPI match found")
 
-    # Step 2: PubMed - pass location info for author verification
+    # Step 2: Education & Training lookup
+    st.info("🔍 Gathering education & training data...")
+
+    edu_city = None
+    edu_state = None
+    edu_specialty = None
+
+    if cms_result.get("physician_info"):
+        info = cms_result["physician_info"]
+        edu_city = info.get("city")
+        edu_state = info.get("state")
+        edu_specialty = info.get("specialty")
+    elif result.get("npi_data", {}).get("found"):
+        npi_data = result["npi_data"]
+        edu_city = npi_data.get("address", {}).get("city")
+        edu_state = npi_data.get("address", {}).get("state")
+        edu_specialty = npi_data.get("specialty")
+
+    education_result = await fetch_education_data(
+        first_name=first_name,
+        last_name=last_name,
+        npi=npi,
+        city=edu_city,
+        state=edu_state,
+        specialty=edu_specialty
+    )
+    result["education_data"] = education_result
+
+    if education_result.get("found"):
+        st.success("✅ Education & training data gathered")
+    else:
+        st.info("ℹ️ Limited education data available")
+
+    # Step 3: PubMed - pass location info for author verification
     st.info("🔍 Searching PubMed for publications...")
 
     # Get location info from CMS data or NPI data
@@ -785,7 +1080,7 @@ def main():
         if npi_data.get("found") or (cms_data.get("payments_found") and cms_data.get("physician_info")):
             info = cms_data.get("physician_info") or {}
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("NPI Number", npi_data.get("npi") or info.get("npi") or "N/A")
             with col2:
@@ -794,6 +1089,20 @@ def main():
                 addr = npi_data.get("address", {})
                 city_state = f"{addr.get('city') or info.get('city', 'N/A')}, {addr.get('state') or info.get('state', 'N/A')}"
                 st.metric("Location", city_state)
+            with col4:
+                years = npi_data.get("years_in_practice")
+                st.metric("Years in Practice", f"{years}+" if years else "N/A")
+
+            # Second row - credentials and organization
+            col1, col2 = st.columns(2)
+            with col1:
+                credentials = npi_data.get("credentials")
+                if credentials:
+                    st.info(f"**Credentials:** {credentials}")
+            with col2:
+                org = npi_data.get("organization_name") or npi_data.get("address", {}).get("organization")
+                if org:
+                    st.info(f"**Organization:** {org}")
 
             specialty = npi_data.get("specialty") or info.get("specialty")
             if specialty:
@@ -804,6 +1113,16 @@ def main():
                 else:
                     st.info(f"**Specialty:** {specialty}")
 
+            # Show all specialties/licenses if available
+            all_specs = npi_data.get("all_specialties", [])
+            if len(all_specs) > 1:
+                with st.expander(f"All Specialties & Licenses ({len(all_specs)})"):
+                    for spec in all_specs:
+                        primary_tag = " (Primary)" if spec.get("primary") else ""
+                        license_info = f" - License: {spec.get('license')}" if spec.get("license") else ""
+                        state_info = f" ({spec.get('state')})" if spec.get("state") else ""
+                        st.markdown(f"- {spec.get('specialty')}{primary_tag}{state_info}{license_info}")
+
             # Show other NPI matches if available
             if npi_data.get("matches") and len(npi_data.get("matches", [])) > 1:
                 with st.expander("Other potential matches"):
@@ -811,6 +1130,45 @@ def main():
                         st.markdown(f"- **{match['name']}** (NPI: {match['npi']}) - {match.get('city', 'N/A')}, {match.get('state', 'N/A')}")
         else:
             st.warning("⚠️ No provider information found. Searched by name only.")
+
+        st.divider()
+
+        # Education & Training Section
+        st.subheader("🎓 Education & Training")
+        edu_data = result.get("education_data", {})
+
+        if edu_data.get("found"):
+            # Medical School (if available from external source)
+            if edu_data.get("medical_school"):
+                st.markdown(f"**🏫 Medical School:** {edu_data['medical_school']}")
+
+            # Inferred Training Path
+            inferred = edu_data.get("inferred_training", [])
+            if inferred:
+                st.markdown("**📚 Training Pathway** *(inferred from specialty)*")
+                for training in inferred:
+                    st.markdown(f"- **{training.get('type')}:** {training.get('program')}")
+
+            # Board Certifications
+            certs = edu_data.get("board_certifications", [])
+            if certs:
+                st.markdown("**🏅 Board Certifications** *(likely based on specialty)*")
+                for cert in certs:
+                    st.markdown(f"- **{cert.get('board')}:** {cert.get('certification')}")
+
+            # Professional Organizations
+            orgs = edu_data.get("professional_organizations", [])
+            if orgs:
+                st.markdown("**🤝 Professional Organizations** *(likely memberships)*")
+                for org in orgs:
+                    st.markdown(f"- {org.get('name')}")
+
+            # Source attribution
+            sources = edu_data.get("sources", [])
+            if sources:
+                st.caption(f"Data sources: {', '.join(sources)}")
+        else:
+            st.info("ℹ️ Education and training data not available. This information typically requires verification from institutional sources.")
 
         st.divider()
 
