@@ -394,64 +394,166 @@ async def fetch_education_data(
     specialty: str = None
 ) -> Dict[str, Any]:
     """
-    Fetch education, training, and professional organization data.
-    Attempts to gather from multiple public sources.
+    Fetch ACTUAL education, training, and professional organization data.
+    Scrapes from public physician directories (Healthgrades, etc.)
     """
+    import re
+
     result = {
         "found": False,
         "medical_school": None,
+        "graduation_year": None,
         "residency": [],
         "fellowships": [],
         "board_certifications": [],
         "professional_organizations": [],
         "sources": [],
-        "inferred_training": []
+        "healthgrades_url": None
     }
 
-    # Infer likely training path based on specialty
-    if specialty:
-        specialty_lower = specialty.lower()
+    # Strategy 1: Try Healthgrades (most comprehensive public source)
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            }
 
-        # Infer fellowship based on specialty
-        if "neurological surgery" in specialty_lower:
-            result["inferred_training"].append({
-                "type": "Residency",
-                "program": "Neurological Surgery Residency (7 years)",
-                "confidence": "inferred from specialty"
-            })
+            # Build Healthgrades search URL
+            name_slug = f"{first_name.lower()}-{last_name.lower()}"
+            state_lower = state.lower() if state else ""
 
-        if "interventional" in specialty_lower or "endovascular" in specialty_lower:
-            result["inferred_training"].append({
-                "type": "Fellowship",
-                "program": "Endovascular/Neurointerventional Fellowship (1-2 years)",
-                "confidence": "inferred from specialty"
-            })
+            # Try direct profile URL pattern first
+            if state:
+                search_url = f"https://www.healthgrades.com/physician/dr-{name_slug}"
+                response = await client.get(search_url, headers=headers)
 
-        if "vascular neurology" in specialty_lower:
-            result["inferred_training"].append({
-                "type": "Residency",
-                "program": "Neurology Residency (4 years)",
-                "confidence": "inferred from specialty"
-            })
-            result["inferred_training"].append({
-                "type": "Fellowship",
-                "program": "Vascular Neurology Fellowship (1-2 years)",
-                "confidence": "inferred from specialty"
-            })
+                if response.status_code == 200 and "medical school" in response.text.lower():
+                    html = response.text
+                    result["healthgrades_url"] = str(response.url)
 
-        if "neuroradiology" in specialty_lower:
-            result["inferred_training"].append({
-                "type": "Residency",
-                "program": "Diagnostic Radiology Residency (5 years)",
-                "confidence": "inferred from specialty"
-            })
-            result["inferred_training"].append({
-                "type": "Fellowship",
-                "program": "Neuroradiology Fellowship (1-2 years)",
-                "confidence": "inferred from specialty"
-            })
+                    # Parse medical school
+                    med_school_patterns = [
+                        r'Medical School[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
+                        r'"medicalSchool"[:\s]*"([^"]+)"',
+                        r'Medical School</dt>\s*<dd[^>]*>([^<]+)',
+                        r'graduated from ([^<,]+(?:University|College|School of Medicine|Medical School)[^<,]*)',
+                    ]
+                    for pattern in med_school_patterns:
+                        match = re.search(pattern, html, re.IGNORECASE)
+                        if match:
+                            school = match.group(1).strip()
+                            if len(school) > 5 and len(school) < 200:
+                                result["medical_school"] = school
+                                result["found"] = True
+                                break
 
-    # Infer likely society memberships based on specialty
+                    # Parse graduation year
+                    grad_patterns = [
+                        r'graduated[^0-9]*(\d{4})',
+                        r'Medical School[^0-9]*(\d{4})',
+                        r'"graduationYear"[:\s]*"?(\d{4})"?',
+                    ]
+                    for pattern in grad_patterns:
+                        match = re.search(pattern, html, re.IGNORECASE)
+                        if match:
+                            year = match.group(1)
+                            if 1950 < int(year) < 2025:
+                                result["graduation_year"] = year
+                                break
+
+                    # Parse residency
+                    residency_patterns = [
+                        r'Residency[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
+                        r'"residency"[:\s]*\[?"([^"\]]+)',
+                        r'Residency</dt>\s*<dd[^>]*>([^<]+)',
+                        r'residency (?:at|in) ([^<,\.]+)',
+                    ]
+                    for pattern in residency_patterns:
+                        matches = re.findall(pattern, html, re.IGNORECASE)
+                        for match in matches:
+                            res = match.strip() if isinstance(match, str) else match[0].strip()
+                            if len(res) > 5 and len(res) < 200 and res not in result["residency"]:
+                                result["residency"].append(res)
+                                result["found"] = True
+
+                    # Parse fellowship
+                    fellowship_patterns = [
+                        r'Fellowship[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
+                        r'"fellowship"[:\s]*\[?"([^"\]]+)',
+                        r'Fellowship</dt>\s*<dd[^>]*>([^<]+)',
+                    ]
+                    for pattern in fellowship_patterns:
+                        matches = re.findall(pattern, html, re.IGNORECASE)
+                        for match in matches:
+                            fel = match.strip() if isinstance(match, str) else match[0].strip()
+                            if len(fel) > 5 and len(fel) < 200 and fel not in result["fellowships"]:
+                                result["fellowships"].append(fel)
+                                result["found"] = True
+
+                    # Parse board certifications
+                    cert_patterns = [
+                        r'Board Certified[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
+                        r'"boardCertification"[:\s]*"([^"]+)"',
+                        r'Certified[^<]*in ([^<,]+)',
+                        r'Board Certification</dt>\s*<dd[^>]*>([^<]+)',
+                    ]
+                    for pattern in cert_patterns:
+                        matches = re.findall(pattern, html, re.IGNORECASE)
+                        for match in matches:
+                            cert = match.strip() if isinstance(match, str) else match[0].strip()
+                            if len(cert) > 3 and len(cert) < 150:
+                                result["board_certifications"].append({
+                                    "certification": cert,
+                                    "source": "Healthgrades"
+                                })
+                                result["found"] = True
+
+                    if result["found"]:
+                        result["sources"].append("Healthgrades")
+
+    except Exception as e:
+        # Healthgrades scraping failed
+        pass
+
+    # Strategy 2: Try WebMD if Healthgrades didn't work
+    if not result["found"]:
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Accept": "text/html,application/xhtml+xml",
+                }
+
+                # WebMD physician search
+                search_url = f"https://doctor.webmd.com/results?q={first_name}%20{last_name}&loc={city or ''}"
+                response = await client.get(search_url, headers=headers)
+
+                if response.status_code == 200:
+                    html = response.text
+
+                    # Look for education info in WebMD results
+                    med_school_match = re.search(r'Medical School[:\s]*([^<\n]+)', html, re.IGNORECASE)
+                    if med_school_match:
+                        result["medical_school"] = med_school_match.group(1).strip()
+                        result["found"] = True
+                        result["sources"].append("WebMD")
+
+        except Exception as e:
+            pass
+
+    # Strategy 3: Try NPI data enrichment services
+    if npi and not result["found"]:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                # NPPES doesn't have education, but some enrichment services do
+                # This is a placeholder for future integration
+                pass
+        except:
+            pass
+
+    # Add likely professional organizations based on specialty (these are reasonable assumptions)
     if specialty:
         specialty_lower = specialty.lower()
         likely_societies = []
@@ -478,95 +580,9 @@ async def fetch_education_data(
             likely_societies.append("American Society of Neuroradiology (ASNR)")
 
         result["professional_organizations"] = [
-            {"name": soc, "confidence": "likely based on specialty"}
+            {"name": soc, "status": "likely member"}
             for soc in likely_societies
         ]
-
-    # Try to fetch from Healthgrades (public physician directory)
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # Healthgrades search
-            search_url = f"https://www.healthgrades.com/api/v2/providers/search"
-            params = {
-                "q": f"{first_name} {last_name}",
-                "location": f"{city}, {state}" if city and state else state or "",
-                "specialty": "neurological-surgery" if specialty and "neuro" in specialty.lower() else ""
-            }
-
-            # Note: Healthgrades API may require additional headers or auth
-            # This is a best-effort attempt
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                "Accept": "application/json"
-            }
-
-            # Try the public API endpoint (may not work without proper auth)
-            response = await client.get(search_url, params=params, headers=headers)
-
-            if response.status_code == 200:
-                data = response.json()
-                # Parse response for education data
-                if data.get("providers"):
-                    provider = data["providers"][0]
-                    if provider.get("education"):
-                        edu = provider["education"]
-                        result["medical_school"] = edu.get("medicalSchool")
-                        result["residency"] = edu.get("residency", [])
-                        result["found"] = True
-                        result["sources"].append("Healthgrades")
-
-    except Exception as e:
-        # Healthgrades fetch failed - continue with other sources
-        pass
-
-    # Try to get board certification from ABMS (if available)
-    # Note: ABMS requires subscription, so this is informational
-    if specialty:
-        specialty_lower = specialty.lower()
-        certs = []
-
-        if "neurological surgery" in specialty_lower:
-            certs.append({
-                "board": "American Board of Neurological Surgery (ABNS)",
-                "certification": "Neurological Surgery",
-                "confidence": "likely based on specialty"
-            })
-
-        if "neurology" in specialty_lower:
-            certs.append({
-                "board": "American Board of Psychiatry and Neurology (ABPN)",
-                "certification": "Neurology",
-                "confidence": "likely based on specialty"
-            })
-
-        if "vascular neurology" in specialty_lower:
-            certs.append({
-                "board": "American Board of Psychiatry and Neurology (ABPN)",
-                "certification": "Vascular Neurology (subspecialty)",
-                "confidence": "likely based on specialty"
-            })
-
-        if "radiology" in specialty_lower:
-            certs.append({
-                "board": "American Board of Radiology (ABR)",
-                "certification": "Diagnostic Radiology",
-                "confidence": "likely based on specialty"
-            })
-
-        if "neuroradiology" in specialty_lower:
-            certs.append({
-                "board": "American Board of Radiology (ABR)",
-                "certification": "Neuroradiology (CAQ)",
-                "confidence": "likely based on specialty"
-            })
-
-        result["board_certifications"] = certs
-
-    # Mark as found if we have any inferred data
-    if result["inferred_training"] or result["board_certifications"] or result["professional_organizations"]:
-        result["found"] = True
-        if "Inferred from specialty" not in result["sources"]:
-            result["sources"].append("Inferred from specialty")
 
     return result
 
@@ -1155,37 +1171,78 @@ def main():
         edu_data = result.get("education_data", {})
 
         if edu_data.get("found"):
-            # Medical School (if available from external source)
+            # Medical School
             if edu_data.get("medical_school"):
-                st.markdown(f"**🏫 Medical School:** {edu_data['medical_school']}")
+                grad_year = edu_data.get("graduation_year")
+                if grad_year:
+                    st.markdown(f"**🏫 Medical School:** {edu_data['medical_school']} ({grad_year})")
+                else:
+                    st.markdown(f"**🏫 Medical School:** {edu_data['medical_school']}")
 
-            # Inferred Training Path
-            inferred = edu_data.get("inferred_training", [])
-            if inferred:
-                st.markdown("**📚 Training Pathway** *(inferred from specialty)*")
-                for training in inferred:
-                    st.markdown(f"- **{training.get('type')}:** {training.get('program')}")
+            # Residency
+            residencies = edu_data.get("residency", [])
+            if residencies:
+                st.markdown("**🏥 Residency:**")
+                for res in residencies:
+                    st.markdown(f"- {res}")
+
+            # Fellowship
+            fellowships = edu_data.get("fellowships", [])
+            if fellowships:
+                st.markdown("**🎯 Fellowship:**")
+                for fel in fellowships:
+                    st.markdown(f"- {fel}")
 
             # Board Certifications
             certs = edu_data.get("board_certifications", [])
             if certs:
-                st.markdown("**🏅 Board Certifications** *(likely based on specialty)*")
+                st.markdown("**🏅 Board Certifications:**")
                 for cert in certs:
-                    st.markdown(f"- **{cert.get('board')}:** {cert.get('certification')}")
+                    if isinstance(cert, dict):
+                        st.markdown(f"- {cert.get('certification')}")
+                    else:
+                        st.markdown(f"- {cert}")
 
             # Professional Organizations
             orgs = edu_data.get("professional_organizations", [])
             if orgs:
-                st.markdown("**🤝 Professional Organizations** *(likely memberships)*")
+                st.markdown("**🤝 Professional Organizations** *(likely memberships based on specialty)*")
                 for org in orgs:
                     st.markdown(f"- {org.get('name')}")
 
-            # Source attribution
+            # Source attribution and Healthgrades link
             sources = edu_data.get("sources", [])
             if sources:
                 st.caption(f"Data sources: {', '.join(sources)}")
+
+            if edu_data.get("healthgrades_url"):
+                st.markdown(f"[View full profile on Healthgrades]({edu_data['healthgrades_url']})")
+
         else:
-            st.info("ℹ️ Education and training data not available. This information typically requires verification from institutional sources.")
+            # No data found - provide search links
+            st.warning("⚠️ Education data not found in public directories.")
+
+            # Generate search URLs for manual lookup
+            from urllib.parse import quote
+            physician_name = result.get("parsed_name", {}).get("full", "")
+            if physician_name:
+                hg_url = f"https://www.healthgrades.com/search?q={quote(physician_name)}"
+                webmd_url = f"https://doctor.webmd.com/results?q={quote(physician_name)}"
+                vitals_url = f"https://www.vitals.com/search?q={quote(physician_name)}"
+
+                st.markdown("**Search for education data manually:**")
+                st.markdown(
+                    f"[![Healthgrades](https://img.shields.io/badge/Healthgrades-Search-00A98F)]({hg_url}) "
+                    f"[![WebMD](https://img.shields.io/badge/WebMD-Search-0063BE)]({webmd_url}) "
+                    f"[![Vitals](https://img.shields.io/badge/Vitals-Search-FF6B35)]({vitals_url})"
+                )
+
+            # Still show likely professional organizations
+            orgs = edu_data.get("professional_organizations", [])
+            if orgs:
+                st.markdown("**🤝 Likely Professional Organizations** *(based on specialty)*")
+                for org in orgs:
+                    st.markdown(f"- {org.get('name')}")
 
         st.divider()
 
