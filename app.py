@@ -1094,7 +1094,7 @@ def main():
                 st.metric("Years in Practice", f"{years}+" if years else "N/A")
 
             # Second row - credentials and organization
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 credentials = npi_data.get("credentials")
                 if credentials:
@@ -1103,6 +1103,23 @@ def main():
                 org = npi_data.get("organization_name") or npi_data.get("address", {}).get("organization")
                 if org:
                     st.info(f"**Organization:** {org}")
+            with col3:
+                # Generate social/professional profile search URLs
+                from urllib.parse import quote
+                physician_name = npi_data.get("verified_name") or info.get("name") or ""
+                location = f"{addr.get('city') or info.get('city', '')}, {addr.get('state') or info.get('state', '')}"
+                linkedin_query = f"{physician_name} {location}".strip()
+                linkedin_url = f"https://www.linkedin.com/search/results/people/?keywords={quote(linkedin_query)}"
+
+                # Doximity search
+                doximity_url = f"https://www.doximity.com/pub/?search={quote(physician_name)}"
+
+                # Display both links
+                st.markdown(
+                    f"[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?logo=linkedin&logoColor=white)]({linkedin_url}) "
+                    f"[![Doximity](https://img.shields.io/badge/Doximity-00A98F?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQxIDAtOC0zLjU5LTgtOHMzLjU5LTggOC04IDggMy41OSA4IDgtMy41OSA4LTggOHoiLz48L3N2Zz4=)]({doximity_url})",
+                    help="Search for this physician on LinkedIn and Doximity"
+                )
 
             specialty = npi_data.get("specialty") or info.get("specialty")
             if specialty:
