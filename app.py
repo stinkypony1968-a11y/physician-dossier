@@ -1259,6 +1259,32 @@ def main():
         st.subheader("🎓 Education & Training")
         edu_data = result.get("education_data", {})
 
+        # Generate search URLs for manual lookup
+        from urllib.parse import quote
+        physician_full_name = result.get("parsed_name", {}).get("full", "")
+        npi_num = npi_data.get("npi") or ""
+
+        # Healthgrades search by name
+        hg_search_url = f"https://www.healthgrades.com/usearch?what={quote(physician_full_name)}"
+        webmd_search_url = f"https://doctor.webmd.com/results?q={quote(physician_full_name)}"
+        vitals_search_url = f"https://www.vitals.com/search?q={quote(physician_full_name)}"
+        doximity_search_url = f"https://www.doximity.com/pub?search={quote(physician_full_name)}"
+
+        # Show prominent search buttons at the top of education section
+        st.markdown("**🔍 Look up education credentials:**")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.markdown(f"[🏥 Healthgrades]({hg_search_url})")
+        with col2:
+            st.markdown(f"[💊 WebMD]({webmd_search_url})")
+        with col3:
+            st.markdown(f"[📋 Vitals]({vitals_search_url})")
+        with col4:
+            st.markdown(f"[👨‍⚕️ Doximity]({doximity_search_url})")
+
+        st.caption("*Click above to verify education on physician directory sites*")
+        st.markdown("---")
+
         if edu_data.get("found"):
             # Medical School
             if edu_data.get("medical_school"):
@@ -1308,25 +1334,10 @@ def main():
                 st.markdown(f"[View full profile on Healthgrades]({edu_data['healthgrades_url']})")
 
         else:
-            # No data found - provide search links
-            st.warning("⚠️ Education data not found in public directories.")
+            # No data found - note the search links are already shown above
+            st.info("ℹ️ Education data not available via automated lookup. Use the search links above to find credentials on Healthgrades, WebMD, or Doximity.")
 
-            # Generate search URLs for manual lookup
-            from urllib.parse import quote
-            physician_name = result.get("parsed_name", {}).get("full", "")
-            if physician_name:
-                hg_url = f"https://www.healthgrades.com/search?q={quote(physician_name)}"
-                webmd_url = f"https://doctor.webmd.com/results?q={quote(physician_name)}"
-                vitals_url = f"https://www.vitals.com/search?q={quote(physician_name)}"
-
-                st.markdown("**Search for education data manually:**")
-                st.markdown(
-                    f"[![Healthgrades](https://img.shields.io/badge/Healthgrades-Search-00A98F)]({hg_url}) "
-                    f"[![WebMD](https://img.shields.io/badge/WebMD-Search-0063BE)]({webmd_url}) "
-                    f"[![Vitals](https://img.shields.io/badge/Vitals-Search-FF6B35)]({vitals_url})"
-                )
-
-            # Still show likely professional organizations
+            # Still show likely professional organizations based on specialty
             orgs = edu_data.get("professional_organizations", [])
             if orgs:
                 st.markdown("**🤝 Likely Professional Organizations** *(based on specialty)*")
