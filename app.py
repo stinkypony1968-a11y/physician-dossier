@@ -416,109 +416,164 @@ async def fetch_education_data(
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Cache-Control": "no-cache",
             }
 
-            # Build Healthgrades search URL
+            # Build multiple URL patterns to try
             name_slug = f"{first_name.lower()}-{last_name.lower()}"
-            state_lower = state.lower() if state else ""
 
-            # Try direct profile URL pattern first
+            # Try different Healthgrades URL patterns
+            urls_to_try = [
+                f"https://www.healthgrades.com/physician/dr-{name_slug}",
+            ]
+
+            # Add state-specific URL if state is provided
             if state:
-                search_url = f"https://www.healthgrades.com/physician/dr-{name_slug}"
-                response = await client.get(search_url, headers=headers)
+                state_lower = state.lower()
+                urls_to_try.insert(0, f"https://www.healthgrades.com/physician/dr-{name_slug}-{state_lower}")
 
-                if response.status_code == 200 and "medical school" in response.text.lower():
-                    html = response.text
-                    result["healthgrades_url"] = str(response.url)
+            for search_url in urls_to_try:
+                try:
+                    response = await client.get(search_url, headers=headers)
 
-                    # Parse medical school
-                    med_school_patterns = [
-                        r'Medical School[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
-                        r'"medicalSchool"[:\s]*"([^"]+)"',
-                        r'Medical School</dt>\s*<dd[^>]*>([^<]+)',
-                        r'graduated from ([^<,]+(?:University|College|School of Medicine|Medical School)[^<,]*)',
-                    ]
-                    for pattern in med_school_patterns:
-                        match = re.search(pattern, html, re.IGNORECASE)
-                        if match:
-                            school = match.group(1).strip()
-                            if len(school) > 5 and len(school) < 200:
-                                result["medical_school"] = school
-                                result["found"] = True
-                                break
+                    if response.status_code == 200:
+                        html = response.text
 
-                    # Parse graduation year
-                    grad_patterns = [
-                        r'graduated[^0-9]*(\d{4})',
-                        r'Medical School[^0-9]*(\d{4})',
-                        r'"graduationYear"[:\s]*"?(\d{4})"?',
-                    ]
-                    for pattern in grad_patterns:
-                        match = re.search(pattern, html, re.IGNORECASE)
-                        if match:
-                            year = match.group(1)
-                            if 1950 < int(year) < 2025:
-                                result["graduation_year"] = year
-                                break
+                        # Check if we found a valid physician page
+                        if "Education" in html or "Medical School" in html or "Residency" in html:
+                            result["healthgrades_url"] = str(response.url)
 
-                    # Parse residency
-                    residency_patterns = [
-                        r'Residency[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
-                        r'"residency"[:\s]*\[?"([^"\]]+)',
-                        r'Residency</dt>\s*<dd[^>]*>([^<]+)',
-                        r'residency (?:at|in) ([^<,\.]+)',
-                    ]
-                    for pattern in residency_patterns:
-                        matches = re.findall(pattern, html, re.IGNORECASE)
-                        for match in matches:
-                            res = match.strip() if isinstance(match, str) else match[0].strip()
-                            if len(res) > 5 and len(res) < 200 and res not in result["residency"]:
-                                result["residency"].append(res)
-                                result["found"] = True
+                            # More comprehensive patterns for Medical School
+                            # Pattern 1: Look for section-based patterns
+                            med_school_patterns = [
+                                # Healthgrades specific patterns - look for text after "Medical School"
+                                r'Medical School:?\s*</[^>]+>\s*([^<]+)',
+                                r'Medical School:?\s*</[^>]+>\s*<[^>]+>\s*([^<]+)',
+                                r'>Medical School:?<[^>]*>\s*<[^>]*>([^<]+)',
+                                r'"medicalSchool"\s*:\s*"([^"]+)"',
+                                r'"medical_school"\s*:\s*"([^"]+)"',
+                                # Generic patterns
+                                r'Medical School[:\s]*\n?\s*([A-Z][^<\n]+(?:University|College|School|Medicine)[^<\n]*)',
+                                r'(?:graduated from|attended)\s+([^<,\n]+(?:University|College|School)[^<,\n]*)',
+                                # Section-based extraction
+                                r'<(?:dt|strong|b)[^>]*>Medical School[:\s]*</(?:dt|strong|b)>\s*<(?:dd|span|div)[^>]*>([^<]+)',
+                                # JSON-LD structured data
+                                r'"alumniOf"[^}]*"name"\s*:\s*"([^"]+)"',
+                            ]
 
-                    # Parse fellowship
-                    fellowship_patterns = [
-                        r'Fellowship[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
-                        r'"fellowship"[:\s]*\[?"([^"\]]+)',
-                        r'Fellowship</dt>\s*<dd[^>]*>([^<]+)',
-                    ]
-                    for pattern in fellowship_patterns:
-                        matches = re.findall(pattern, html, re.IGNORECASE)
-                        for match in matches:
-                            fel = match.strip() if isinstance(match, str) else match[0].strip()
-                            if len(fel) > 5 and len(fel) < 200 and fel not in result["fellowships"]:
-                                result["fellowships"].append(fel)
-                                result["found"] = True
+                            for pattern in med_school_patterns:
+                                match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+                                if match:
+                                    school = match.group(1).strip()
+                                    # Clean up the school name
+                                    school = re.sub(r'\s+', ' ', school)  # Normalize whitespace
+                                    school = school.strip(',.- ')
+                                    if len(school) > 10 and len(school) < 200:
+                                        # Validate it looks like a school name
+                                        if any(word in school.lower() for word in ['university', 'college', 'school', 'medicine', 'medical']):
+                                            result["medical_school"] = school
+                                            result["found"] = True
+                                            break
 
-                    # Parse board certifications
-                    cert_patterns = [
-                        r'Board Certified[:\s]*</[^>]+>\s*<[^>]+>([^<]+)',
-                        r'"boardCertification"[:\s]*"([^"]+)"',
-                        r'Certified[^<]*in ([^<,]+)',
-                        r'Board Certification</dt>\s*<dd[^>]*>([^<]+)',
-                    ]
-                    for pattern in cert_patterns:
-                        matches = re.findall(pattern, html, re.IGNORECASE)
-                        for match in matches:
-                            cert = match.strip() if isinstance(match, str) else match[0].strip()
-                            if len(cert) > 3 and len(cert) < 150:
-                                result["board_certifications"].append({
-                                    "certification": cert,
-                                    "source": "Healthgrades"
-                                })
-                                result["found"] = True
+                            # Parse graduation year
+                            if result["medical_school"]:
+                                grad_patterns = [
+                                    r'graduated[^0-9]*(\d{4})',
+                                    r'class of (\d{4})',
+                                    r'"graduationYear"\s*:\s*"?(\d{4})"?',
+                                    r'Medical School[^0-9]*(\d{4})',
+                                ]
+                                for pattern in grad_patterns:
+                                    match = re.search(pattern, html, re.IGNORECASE)
+                                    if match:
+                                        year = match.group(1)
+                                        if 1950 < int(year) < 2030:
+                                            result["graduation_year"] = year
+                                            break
 
-                    if result["found"]:
-                        result["sources"].append("Healthgrades")
+                            # Parse residency - look for section after "Residency"
+                            residency_patterns = [
+                                r'Residency:?\s*</[^>]+>\s*([^<]+)',
+                                r'Residency:?\s*</[^>]+>\s*<[^>]+>\s*([^<]+)',
+                                r'>Residency:?<[^>]*>\s*<[^>]*>([^<]+)',
+                                r'"residency"\s*:\s*"([^"]+)"',
+                                r'"residencyProgram"\s*:\s*"([^"]+)"',
+                                r'<(?:dt|strong|b)[^>]*>Residency[:\s]*</(?:dt|strong|b)>\s*<(?:dd|span|div)[^>]*>([^<]+)',
+                                r'Residency[:\s]*\n?\s*([A-Z][^<\n]+(?:Hospital|Medical|University|Clinic)[^<\n]*)',
+                            ]
+
+                            for pattern in residency_patterns:
+                                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                                for match in matches:
+                                    res = match.strip() if isinstance(match, str) else match
+                                    res = re.sub(r'\s+', ' ', res).strip(',.- ')
+                                    if len(res) > 10 and len(res) < 200:
+                                        # Validate it looks like a hospital/program name
+                                        if any(word in res.lower() for word in ['hospital', 'medical', 'university', 'clinic', 'center', 'health']):
+                                            if res not in result["residency"]:
+                                                result["residency"].append(res)
+                                                result["found"] = True
+
+                            # Parse fellowship
+                            fellowship_patterns = [
+                                r'Fellowship:?\s*</[^>]+>\s*([^<]+)',
+                                r'Fellowship:?\s*</[^>]+>\s*<[^>]+>\s*([^<]+)',
+                                r'>Fellowship:?<[^>]*>\s*<[^>]*>([^<]+)',
+                                r'"fellowship"\s*:\s*"([^"]+)"',
+                                r'<(?:dt|strong|b)[^>]*>Fellowship[:\s]*</(?:dt|strong|b)>\s*<(?:dd|span|div)[^>]*>([^<]+)',
+                                r'Fellowship[:\s]*\n?\s*([A-Z][^<\n]+(?:Hospital|Medical|University)[^<\n]*)',
+                            ]
+
+                            for pattern in fellowship_patterns:
+                                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                                for match in matches:
+                                    fel = match.strip() if isinstance(match, str) else match
+                                    fel = re.sub(r'\s+', ' ', fel).strip(',.- ')
+                                    if len(fel) > 10 and len(fel) < 200:
+                                        if fel not in result["fellowships"]:
+                                            result["fellowships"].append(fel)
+                                            result["found"] = True
+
+                            # Parse board certifications
+                            cert_patterns = [
+                                r'Board Certifications?:?\s*</[^>]+>\s*([^<]+)',
+                                r'"boardCertification"\s*:\s*"([^"]+)"',
+                                r'"certifications"\s*:\s*\[([^\]]+)\]',
+                                r'Certified in ([^<,\n]+)',
+                                r'Board Certified[^<]*in ([^<]+)',
+                            ]
+
+                            for pattern in cert_patterns:
+                                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                                for match in matches:
+                                    cert = match.strip() if isinstance(match, str) else match
+                                    cert = re.sub(r'\s+', ' ', cert).strip(',.- ')
+                                    if len(cert) > 5 and len(cert) < 150:
+                                        existing_certs = [c.get('certification', '') for c in result["board_certifications"]]
+                                        if cert not in existing_certs:
+                                            result["board_certifications"].append({
+                                                "certification": cert,
+                                                "source": "Healthgrades"
+                                            })
+                                            result["found"] = True
+
+                            if result["found"]:
+                                result["sources"].append("Healthgrades")
+                                break  # Stop trying other URLs
+
+                except Exception as inner_e:
+                    continue
 
     except Exception as e:
-        # Healthgrades scraping failed
+        # Healthgrades scraping failed silently
         pass
 
-    # Strategy 2: Try WebMD if Healthgrades didn't work
-    if not result["found"]:
+    # Strategy 2: Try WebMD if Healthgrades didn't find data
+    if not result.get("medical_school"):
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                 headers = {
@@ -527,30 +582,64 @@ async def fetch_education_data(
                 }
 
                 # WebMD physician search
-                search_url = f"https://doctor.webmd.com/results?q={first_name}%20{last_name}&loc={city or ''}"
+                search_url = f"https://doctor.webmd.com/results?q={first_name}%20{last_name}"
+                if city:
+                    search_url += f"&loc={city}"
+
                 response = await client.get(search_url, headers=headers)
 
                 if response.status_code == 200:
                     html = response.text
 
                     # Look for education info in WebMD results
-                    med_school_match = re.search(r'Medical School[:\s]*([^<\n]+)', html, re.IGNORECASE)
-                    if med_school_match:
-                        result["medical_school"] = med_school_match.group(1).strip()
-                        result["found"] = True
-                        result["sources"].append("WebMD")
+                    med_school_patterns = [
+                        r'Medical School:?\s*([^<\n]+(?:University|College|School)[^<\n]*)',
+                        r'"medicalSchool"\s*:\s*"([^"]+)"',
+                    ]
+                    for pattern in med_school_patterns:
+                        match = re.search(pattern, html, re.IGNORECASE)
+                        if match:
+                            school = match.group(1).strip()
+                            if len(school) > 10 and len(school) < 200:
+                                result["medical_school"] = school
+                                result["found"] = True
+                                if "WebMD" not in result["sources"]:
+                                    result["sources"].append("WebMD")
+                                break
 
         except Exception as e:
             pass
 
-    # Strategy 3: Try NPI data enrichment services
-    if npi and not result["found"]:
+    # Strategy 3: Try Doximity public profile (if available)
+    if not result.get("medical_school"):
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                # NPPES doesn't have education, but some enrichment services do
-                # This is a placeholder for future integration
-                pass
-        except:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                }
+
+                search_url = f"https://www.doximity.com/pub/{first_name.lower()}-{last_name.lower()}"
+                response = await client.get(search_url, headers=headers)
+
+                if response.status_code == 200:
+                    html = response.text
+
+                    # Look for education data
+                    med_patterns = [
+                        r'"school"\s*:\s*"([^"]+)"',
+                        r'Medical School[:\s]*([^<\n]+)',
+                    ]
+                    for pattern in med_patterns:
+                        match = re.search(pattern, html, re.IGNORECASE)
+                        if match:
+                            school = match.group(1).strip()
+                            if len(school) > 10 and any(word in school.lower() for word in ['university', 'college', 'school', 'medicine']):
+                                result["medical_school"] = school
+                                result["found"] = True
+                                result["sources"].append("Doximity")
+                                break
+
+        except Exception as e:
             pass
 
     # Add likely professional organizations based on specialty (these are reasonable assumptions)
