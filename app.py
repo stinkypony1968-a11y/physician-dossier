@@ -385,6 +385,38 @@ KNOWN_FELLOWSHIPS = {
 }
 
 
+def _parse_education_json(text: str) -> Dict[str, Any]:
+    """Parse JSON from Claude's response."""
+    import json
+    import re
+
+    text = text.strip()
+
+    # Remove markdown code blocks
+    if "```json" in text:
+        start = text.find("```json") + 7
+        end = text.find("```", start)
+        if end > start:
+            text = text[start:end]
+    elif "```" in text:
+        start = text.find("```") + 3
+        end = text.find("```", start)
+        if end > start:
+            text = text[start:end]
+
+    # Find JSON object
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            json_str = text[start:end]
+            return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+
+    return {"error": "Failed to parse response"}
+
+
 async def fetch_education_data(
     first_name: str,
     last_name: str,
@@ -395,9 +427,10 @@ async def fetch_education_data(
 ) -> Dict[str, Any]:
     """
     Fetch ACTUAL education, training, and professional organization data.
-    Scrapes from public physician directories (Healthgrades, etc.)
+    Uses Claude AI with web search to find physician information from Healthgrades, Doximity, etc.
     """
     import re
+    import json
 
     result = {
         "found": False,
@@ -411,236 +444,143 @@ async def fetch_education_data(
         "healthgrades_url": None
     }
 
-    # Strategy 1: Try Healthgrades (most comprehensive public source)
+    # Get Anthropic API key from environment or Streamlit secrets
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not anthropic_api_key:
+        try:
+            anthropic_api_key = st.secrets.get("ANTHROPIC_API_KEY")
+        except:
+            pass
+
+    if not anthropic_api_key:
+        # No API key - can't use AI search
+        return result
+
+    # Build search context
+    physician_name = f"{first_name} {last_name}"
+    search_hints = []
+    if city:
+        search_hints.append(f"in {city}")
+    if state:
+        search_hints.append(state)
+    if specialty:
+        search_hints.append(f"specialty: {specialty}")
+
+    context = f" ({', '.join(search_hints)})" if search_hints else ""
+
+    system_prompt = """You are researching a physician's professional background. Search for their profile and extract factual information.
+
+Focus on finding:
+1. Medical school name and graduation year
+2. Residency program/institution and completion year
+3. Fellowship type, institution, and completion year
+4. Board certifications
+5. Professional society memberships (SNIS, SVIN, AANS, CNS, AAN, etc.)
+
+Search strategies:
+- Try "[physician name] MD education" or "[physician name] fellowship training"
+- Check Healthgrades, Doximity, hospital bio pages, medical society directories
+- Look for "Find a Doctor" pages at major hospitals
+
+Return ONLY valid JSON in this exact format (use null for unknown fields, empty arrays for lists with no items):
+{
+  "medical_school": "Full name of medical school" or null,
+  "graduation_year": 2005 or null,
+  "residency": "Program name at Institution" or null,
+  "residency_year": 2010 or null,
+  "fellowship": "Fellowship type at Institution" or null,
+  "fellowship_year": 2012 or null,
+  "board_certifications": ["Neurological Surgery", "Endovascular Neurosurgery"] or [],
+  "society_memberships": ["SNIS", "AANS", "CNS"] or [],
+  "confidence": "high" or "medium" or "low",
+  "sources": ["Healthgrades", "Doximity", etc.]
+}
+
+IMPORTANT: Only include information you can verify from search results. Use null for fields you cannot find."""
+
+    user_prompt = f"""Search for professional education and training information about this physician:
+
+Name: {physician_name}{context}
+
+Find their:
+- Medical school and graduation year
+- Residency program and institution
+- Fellowship training (if any)
+- Board certifications
+- Professional society memberships
+
+Return the information as JSON only, no other text."""
+
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Cache-Control": "no-cache",
-            }
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 2000,
+                    "system": system_prompt,
+                    "tools": [
+                        {
+                            "type": "web_search_20250305",
+                            "name": "web_search",
+                            "max_uses": 5
+                        }
+                    ],
+                    "messages": [{"role": "user", "content": user_prompt}]
+                }
+            )
 
-            # Build multiple URL patterns to try
-            name_slug = f"{first_name.lower()}-{last_name.lower()}"
+            if response.status_code != 200:
+                return result
 
-            # Try different Healthgrades URL patterns
-            urls_to_try = [
-                f"https://www.healthgrades.com/physician/dr-{name_slug}",
-            ]
+            data = response.json()
 
-            # Add state-specific URL if state is provided
-            if state:
-                state_lower = state.lower()
-                urls_to_try.insert(0, f"https://www.healthgrades.com/physician/dr-{name_slug}-{state_lower}")
+            # Extract text from response (may have multiple content blocks)
+            response_text = ""
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    response_text += block.get("text", "")
 
-            for search_url in urls_to_try:
-                try:
-                    response = await client.get(search_url, headers=headers)
+            # Parse JSON from response
+            ai_data = _parse_education_json(response_text)
 
-                    if response.status_code == 200:
-                        html = response.text
-
-                        # Check if we found a valid physician page
-                        if "Education" in html or "Medical School" in html or "Residency" in html:
-                            result["healthgrades_url"] = str(response.url)
-
-                            # More comprehensive patterns for Medical School
-                            # Pattern 1: Look for section-based patterns
-                            med_school_patterns = [
-                                # Healthgrades specific patterns - look for text after "Medical School"
-                                r'Medical School:?\s*</[^>]+>\s*([^<]+)',
-                                r'Medical School:?\s*</[^>]+>\s*<[^>]+>\s*([^<]+)',
-                                r'>Medical School:?<[^>]*>\s*<[^>]*>([^<]+)',
-                                r'"medicalSchool"\s*:\s*"([^"]+)"',
-                                r'"medical_school"\s*:\s*"([^"]+)"',
-                                # Generic patterns
-                                r'Medical School[:\s]*\n?\s*([A-Z][^<\n]+(?:University|College|School|Medicine)[^<\n]*)',
-                                r'(?:graduated from|attended)\s+([^<,\n]+(?:University|College|School)[^<,\n]*)',
-                                # Section-based extraction
-                                r'<(?:dt|strong|b)[^>]*>Medical School[:\s]*</(?:dt|strong|b)>\s*<(?:dd|span|div)[^>]*>([^<]+)',
-                                # JSON-LD structured data
-                                r'"alumniOf"[^}]*"name"\s*:\s*"([^"]+)"',
-                            ]
-
-                            for pattern in med_school_patterns:
-                                match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-                                if match:
-                                    school = match.group(1).strip()
-                                    # Clean up the school name
-                                    school = re.sub(r'\s+', ' ', school)  # Normalize whitespace
-                                    school = school.strip(',.- ')
-                                    if len(school) > 10 and len(school) < 200:
-                                        # Validate it looks like a school name
-                                        if any(word in school.lower() for word in ['university', 'college', 'school', 'medicine', 'medical']):
-                                            result["medical_school"] = school
-                                            result["found"] = True
-                                            break
-
-                            # Parse graduation year
-                            if result["medical_school"]:
-                                grad_patterns = [
-                                    r'graduated[^0-9]*(\d{4})',
-                                    r'class of (\d{4})',
-                                    r'"graduationYear"\s*:\s*"?(\d{4})"?',
-                                    r'Medical School[^0-9]*(\d{4})',
-                                ]
-                                for pattern in grad_patterns:
-                                    match = re.search(pattern, html, re.IGNORECASE)
-                                    if match:
-                                        year = match.group(1)
-                                        if 1950 < int(year) < 2030:
-                                            result["graduation_year"] = year
-                                            break
-
-                            # Parse residency - look for section after "Residency"
-                            residency_patterns = [
-                                r'Residency:?\s*</[^>]+>\s*([^<]+)',
-                                r'Residency:?\s*</[^>]+>\s*<[^>]+>\s*([^<]+)',
-                                r'>Residency:?<[^>]*>\s*<[^>]*>([^<]+)',
-                                r'"residency"\s*:\s*"([^"]+)"',
-                                r'"residencyProgram"\s*:\s*"([^"]+)"',
-                                r'<(?:dt|strong|b)[^>]*>Residency[:\s]*</(?:dt|strong|b)>\s*<(?:dd|span|div)[^>]*>([^<]+)',
-                                r'Residency[:\s]*\n?\s*([A-Z][^<\n]+(?:Hospital|Medical|University|Clinic)[^<\n]*)',
-                            ]
-
-                            for pattern in residency_patterns:
-                                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
-                                for match in matches:
-                                    res = match.strip() if isinstance(match, str) else match
-                                    res = re.sub(r'\s+', ' ', res).strip(',.- ')
-                                    if len(res) > 10 and len(res) < 200:
-                                        # Validate it looks like a hospital/program name
-                                        if any(word in res.lower() for word in ['hospital', 'medical', 'university', 'clinic', 'center', 'health']):
-                                            if res not in result["residency"]:
-                                                result["residency"].append(res)
-                                                result["found"] = True
-
-                            # Parse fellowship
-                            fellowship_patterns = [
-                                r'Fellowship:?\s*</[^>]+>\s*([^<]+)',
-                                r'Fellowship:?\s*</[^>]+>\s*<[^>]+>\s*([^<]+)',
-                                r'>Fellowship:?<[^>]*>\s*<[^>]*>([^<]+)',
-                                r'"fellowship"\s*:\s*"([^"]+)"',
-                                r'<(?:dt|strong|b)[^>]*>Fellowship[:\s]*</(?:dt|strong|b)>\s*<(?:dd|span|div)[^>]*>([^<]+)',
-                                r'Fellowship[:\s]*\n?\s*([A-Z][^<\n]+(?:Hospital|Medical|University)[^<\n]*)',
-                            ]
-
-                            for pattern in fellowship_patterns:
-                                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
-                                for match in matches:
-                                    fel = match.strip() if isinstance(match, str) else match
-                                    fel = re.sub(r'\s+', ' ', fel).strip(',.- ')
-                                    if len(fel) > 10 and len(fel) < 200:
-                                        if fel not in result["fellowships"]:
-                                            result["fellowships"].append(fel)
-                                            result["found"] = True
-
-                            # Parse board certifications
-                            cert_patterns = [
-                                r'Board Certifications?:?\s*</[^>]+>\s*([^<]+)',
-                                r'"boardCertification"\s*:\s*"([^"]+)"',
-                                r'"certifications"\s*:\s*\[([^\]]+)\]',
-                                r'Certified in ([^<,\n]+)',
-                                r'Board Certified[^<]*in ([^<]+)',
-                            ]
-
-                            for pattern in cert_patterns:
-                                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
-                                for match in matches:
-                                    cert = match.strip() if isinstance(match, str) else match
-                                    cert = re.sub(r'\s+', ' ', cert).strip(',.- ')
-                                    if len(cert) > 5 and len(cert) < 150:
-                                        existing_certs = [c.get('certification', '') for c in result["board_certifications"]]
-                                        if cert not in existing_certs:
-                                            result["board_certifications"].append({
-                                                "certification": cert,
-                                                "source": "Healthgrades"
-                                            })
-                                            result["found"] = True
-
-                            if result["found"]:
-                                result["sources"].append("Healthgrades")
-                                break  # Stop trying other URLs
-
-                except Exception as inner_e:
-                    continue
+            if ai_data and "error" not in ai_data:
+                # Map AI response to our result format
+                if ai_data.get("medical_school"):
+                    result["medical_school"] = ai_data["medical_school"]
+                    result["found"] = True
+                if ai_data.get("graduation_year"):
+                    result["graduation_year"] = str(ai_data["graduation_year"])
+                if ai_data.get("residency"):
+                    result["residency"] = [ai_data["residency"]]
+                    result["found"] = True
+                if ai_data.get("fellowship"):
+                    result["fellowships"] = [ai_data["fellowship"]]
+                    result["found"] = True
+                if ai_data.get("board_certifications"):
+                    result["board_certifications"] = [
+                        {"certification": cert, "source": "AI Search"}
+                        for cert in ai_data["board_certifications"]
+                    ]
+                    result["found"] = True
+                if ai_data.get("society_memberships"):
+                    result["professional_organizations"] = [
+                        {"name": soc, "status": "verified"}
+                        for soc in ai_data["society_memberships"]
+                    ]
+                if ai_data.get("sources"):
+                    result["sources"] = ai_data["sources"]
+                else:
+                    result["sources"] = ["AI Web Search"]
 
     except Exception as e:
-        # Healthgrades scraping failed silently
+        # AI search failed
         pass
-
-    # Strategy 2: Try WebMD if Healthgrades didn't find data
-    if not result.get("medical_school"):
-        try:
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    "Accept": "text/html,application/xhtml+xml",
-                }
-
-                # WebMD physician search
-                search_url = f"https://doctor.webmd.com/results?q={first_name}%20{last_name}"
-                if city:
-                    search_url += f"&loc={city}"
-
-                response = await client.get(search_url, headers=headers)
-
-                if response.status_code == 200:
-                    html = response.text
-
-                    # Look for education info in WebMD results
-                    med_school_patterns = [
-                        r'Medical School:?\s*([^<\n]+(?:University|College|School)[^<\n]*)',
-                        r'"medicalSchool"\s*:\s*"([^"]+)"',
-                    ]
-                    for pattern in med_school_patterns:
-                        match = re.search(pattern, html, re.IGNORECASE)
-                        if match:
-                            school = match.group(1).strip()
-                            if len(school) > 10 and len(school) < 200:
-                                result["medical_school"] = school
-                                result["found"] = True
-                                if "WebMD" not in result["sources"]:
-                                    result["sources"].append("WebMD")
-                                break
-
-        except Exception as e:
-            pass
-
-    # Strategy 3: Try Doximity public profile (if available)
-    if not result.get("medical_school"):
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                }
-
-                search_url = f"https://www.doximity.com/pub/{first_name.lower()}-{last_name.lower()}"
-                response = await client.get(search_url, headers=headers)
-
-                if response.status_code == 200:
-                    html = response.text
-
-                    # Look for education data
-                    med_patterns = [
-                        r'"school"\s*:\s*"([^"]+)"',
-                        r'Medical School[:\s]*([^<\n]+)',
-                    ]
-                    for pattern in med_patterns:
-                        match = re.search(pattern, html, re.IGNORECASE)
-                        if match:
-                            school = match.group(1).strip()
-                            if len(school) > 10 and any(word in school.lower() for word in ['university', 'college', 'school', 'medicine']):
-                                result["medical_school"] = school
-                                result["found"] = True
-                                result["sources"].append("Doximity")
-                                break
-
-        except Exception as e:
-            pass
 
     # Add likely professional organizations based on specialty (these are reasonable assumptions)
     if specialty:
