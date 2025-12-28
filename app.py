@@ -902,7 +902,6 @@ async def run_dossier_pipeline(physician_name: str, state: str = None, city: str
         "parsed_name": {"first": first_name, "last": last_name, "full": full_name},
         "npi_data": None,
         "cms_data": None,
-        "education_data": None,
         "publications": None,
         "timestamp": datetime.now().isoformat()
     }
@@ -938,40 +937,7 @@ async def run_dossier_pipeline(physician_name: str, state: str = None, city: str
         else:
             st.warning("⚠️ No NPI match found")
 
-    # Step 2: Education & Training lookup
-    st.info("🔍 Gathering education & training data...")
-
-    edu_city = None
-    edu_state = None
-    edu_specialty = None
-
-    if cms_result.get("physician_info"):
-        info = cms_result["physician_info"]
-        edu_city = info.get("city")
-        edu_state = info.get("state")
-        edu_specialty = info.get("specialty")
-    elif result.get("npi_data", {}).get("found"):
-        npi_data = result["npi_data"]
-        edu_city = npi_data.get("address", {}).get("city")
-        edu_state = npi_data.get("address", {}).get("state")
-        edu_specialty = npi_data.get("specialty")
-
-    education_result = await fetch_education_data(
-        first_name=first_name,
-        last_name=last_name,
-        npi=npi,
-        city=edu_city,
-        state=edu_state,
-        specialty=edu_specialty
-    )
-    result["education_data"] = education_result
-
-    if education_result.get("found"):
-        st.success("✅ Education & training data gathered")
-    else:
-        st.info("ℹ️ Limited education data available")
-
-    # Step 3: PubMed - pass location info for author verification
+    # Step 2: PubMed - pass location info for author verification
     st.info("🔍 Searching PubMed for publications...")
 
     # Get location info from CMS data or NPI data
@@ -1192,97 +1158,6 @@ def main():
                         st.markdown(f"- **{match['name']}** (NPI: {match['npi']}) - {match.get('city', 'N/A')}, {match.get('state', 'N/A')}")
         else:
             st.warning("⚠️ No provider information found. Searched by name only.")
-
-        st.divider()
-
-        # Education & Training Section
-        st.subheader("🎓 Education & Training")
-        edu_data = result.get("education_data", {})
-
-        # Generate search URLs for manual lookup
-        from urllib.parse import quote
-        physician_full_name = result.get("parsed_name", {}).get("full", "")
-        npi_num = npi_data.get("npi") or ""
-
-        # Healthgrades search by name
-        hg_search_url = f"https://www.healthgrades.com/usearch?what={quote(physician_full_name)}"
-        webmd_search_url = f"https://doctor.webmd.com/results?q={quote(physician_full_name)}"
-        vitals_search_url = f"https://www.vitals.com/search?q={quote(physician_full_name)}"
-        doximity_search_url = f"https://www.doximity.com/pub?search={quote(physician_full_name)}"
-
-        # Show prominent search buttons at the top of education section
-        st.markdown("**🔍 Look up education credentials:**")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.markdown(f"[🏥 Healthgrades]({hg_search_url})")
-        with col2:
-            st.markdown(f"[💊 WebMD]({webmd_search_url})")
-        with col3:
-            st.markdown(f"[📋 Vitals]({vitals_search_url})")
-        with col4:
-            st.markdown(f"[👨‍⚕️ Doximity]({doximity_search_url})")
-
-        st.caption("*Click above to verify education on physician directory sites*")
-        st.markdown("---")
-
-        if edu_data.get("found"):
-            # Medical School
-            if edu_data.get("medical_school"):
-                grad_year = edu_data.get("graduation_year")
-                if grad_year:
-                    st.markdown(f"**🏫 Medical School:** {edu_data['medical_school']} ({grad_year})")
-                else:
-                    st.markdown(f"**🏫 Medical School:** {edu_data['medical_school']}")
-
-            # Residency
-            residencies = edu_data.get("residency", [])
-            if residencies:
-                st.markdown("**🏥 Residency:**")
-                for res in residencies:
-                    st.markdown(f"- {res}")
-
-            # Fellowship
-            fellowships = edu_data.get("fellowships", [])
-            if fellowships:
-                st.markdown("**🎯 Fellowship:**")
-                for fel in fellowships:
-                    st.markdown(f"- {fel}")
-
-            # Board Certifications
-            certs = edu_data.get("board_certifications", [])
-            if certs:
-                st.markdown("**🏅 Board Certifications:**")
-                for cert in certs:
-                    if isinstance(cert, dict):
-                        st.markdown(f"- {cert.get('certification')}")
-                    else:
-                        st.markdown(f"- {cert}")
-
-            # Professional Organizations
-            orgs = edu_data.get("professional_organizations", [])
-            if orgs:
-                st.markdown("**🤝 Professional Organizations** *(likely memberships based on specialty)*")
-                for org in orgs:
-                    st.markdown(f"- {org.get('name')}")
-
-            # Source attribution and Healthgrades link
-            sources = edu_data.get("sources", [])
-            if sources:
-                st.caption(f"Data sources: {', '.join(sources)}")
-
-            if edu_data.get("healthgrades_url"):
-                st.markdown(f"[View full profile on Healthgrades]({edu_data['healthgrades_url']})")
-
-        else:
-            # No data found - note the search links are already shown above
-            st.info("ℹ️ Education data not available via automated lookup. Use the search links above to find credentials on Healthgrades, WebMD, or Doximity.")
-
-            # Still show likely professional organizations based on specialty
-            orgs = edu_data.get("professional_organizations", [])
-            if orgs:
-                st.markdown("**🤝 Likely Professional Organizations** *(based on specialty)*")
-                for org in orgs:
-                    st.markdown(f"- {org.get('name')}")
 
         st.divider()
 
